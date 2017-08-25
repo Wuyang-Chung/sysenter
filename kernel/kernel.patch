@@ -1,0 +1,374 @@
+Index: i386/exception.s
+===================================================================
+RCS file: /home/ncvs/src/sys/i386/i386/exception.s,v
+retrieving revision 1.116
+diff -u -r1.116 exception.s
+--- i386/exception.s	4 Apr 2006 02:26:45 -0000	1.116
++++ i386/exception.s	18 May 2006 04:23:46 -0000
+@@ -334,3 +334,5 @@
+ 	movl	$0,TF_ERR(%esp)	/* XXX should be the error code */
+ 	movl	$T_PROTFLT,TF_TRAPNO(%esp)
+ 	jmp	alltraps_with_regs_pushed
++
++#include <i386/i386/sysenter.s>
+Index: i386/genassym.c
+===================================================================
+RCS file: /home/ncvs/src/sys/i386/i386/genassym.c,v
+retrieving revision 1.153
+diff -u -r1.153 genassym.c
+--- i386/genassym.c	29 Dec 2005 13:23:48 -0000	1.153
++++ i386/genassym.c	18 May 2006 04:23:46 -0000
+@@ -71,6 +71,7 @@
+ #endif
+ #include <machine/cpu.h>
+ #include <machine/pcb.h>
++#include <machine/pcb_ext.h>
+ #include <machine/sigframe.h>
+ #include <machine/vm86.h>
+ #include <machine/proc.h>
+@@ -132,7 +133,10 @@
+ ASSYM(PCB_DR7, offsetof(struct pcb, pcb_dr7));
+ ASSYM(PCB_PSL, offsetof(struct pcb, pcb_psl));
+ ASSYM(PCB_DBREGS, PCB_DBREGS);
++ASSYM(PCB_FULLCTX, PCB_FULLCTX);
++ASSYM(PCB_SYSENTER, PCB_SYSENTER);
+ ASSYM(PCB_EXT, offsetof(struct pcb, pcb_ext));
++ASSYM(PCB_EXT_TSS_ESP0, offsetof(struct pcb_ext, ext_tss.tss_esp0));
+ 
+ ASSYM(PCB_FSD, offsetof(struct pcb, pcb_fsd));
+ ASSYM(PCB_VM86, offsetof(struct pcb, pcb_vm86));
+@@ -144,11 +148,15 @@
+ ASSYM(PCB_SIZE, sizeof(struct pcb));
+ ASSYM(PCB_VM86CALL, PCB_VM86CALL);
+ 
++ASSYM(TF_EAX, offsetof(struct trapframe, tf_eax));
++ASSYM(TF_EDX, offsetof(struct trapframe, tf_edx));
++ASSYM(TF_ECX, offsetof(struct trapframe, tf_ecx));
+ ASSYM(TF_TRAPNO, offsetof(struct trapframe, tf_trapno));
+ ASSYM(TF_ERR, offsetof(struct trapframe, tf_err));
+ ASSYM(TF_EIP, offsetof(struct trapframe, tf_eip));
+ ASSYM(TF_CS, offsetof(struct trapframe, tf_cs));
+ ASSYM(TF_EFLAGS, offsetof(struct trapframe, tf_eflags));
++ASSYM(TF_ESP, offsetof(struct trapframe, tf_esp));
+ ASSYM(SIGF_HANDLER, offsetof(struct sigframe, sf_ahu.sf_handler));
+ #ifdef COMPAT_43
+ ASSYM(SIGF_SC, offsetof(struct osigframe, sf_siginfo.si_sc));
+@@ -198,6 +206,7 @@
+ ASSYM(PC_CPUID, offsetof(struct pcpu, pc_cpuid));
+ ASSYM(PC_CURPMAP, offsetof(struct pcpu, pc_curpmap));
+ ASSYM(PC_PRIVATE_TSS, offsetof(struct pcpu, pc_private_tss));
++ASSYM(PC_SYSENTER_STACKPTR, offsetof(struct pcpu, pc_sysenter_stackptr));
+ 
+ #ifdef DEV_APIC
+ ASSYM(LA_VER, offsetof(struct LAPIC, version));
+@@ -213,6 +222,9 @@
+ ASSYM(KDSEL, GSEL(GDATA_SEL, SEL_KPL));
+ ASSYM(KPSEL, GSEL(GPRIV_SEL, SEL_KPL));
+ 
++ASSYM(UCSEL, GSEL(GUCODE_SEL, SEL_UPL));
++ASSYM(UDSEL, GSEL(GUDATA_SEL, SEL_UPL));
++
+ ASSYM(BC32SEL, GSEL(GBIOSCODE32_SEL, SEL_KPL));
+ ASSYM(GPROC0_SEL, GPROC0_SEL);
+ ASSYM(VM86_FRAMESIZE, sizeof(struct vm86frame));
+Index: i386/machdep.c
+===================================================================
+RCS file: /home/ncvs/src/sys/i386/i386/machdep.c,v
+retrieving revision 1.626
+diff -u -r1.626 machdep.c
+--- i386/machdep.c	11 May 2006 17:29:23 -0000	1.626
++++ i386/machdep.c	18 May 2006 04:23:47 -0000
+@@ -167,6 +167,15 @@
+ static void set_fpregs_xmm(struct save87 *, struct savexmm *);
+ static void fill_fpregs_xmm(struct savexmm *, struct save87 *);
+ #endif /* CPU_ENABLE_SSE */
++
++struct sysenter_pcpu {
++	char	stack[KSTACK_PAGES * PAGE_SIZE];
++};
++
++static struct sysenter_pcpu	sysenter_pcpus[MAXCPU];
++
++static void sysenter_setup(void);
++
+ SYSINIT(cpu, SI_SUB_CPU, SI_ORDER_FIRST, cpu_startup, NULL)
+ 
+ #ifdef DDB
+@@ -782,6 +791,7 @@
+ 	SIG_CANTMASK(td->td_sigmask);
+ 	signotify(td);
+ 	PROC_UNLOCK(p);
++	td->td_pcb->pcb_flags |= PCB_FULLCTX;
+ 	return (EJUSTRETURN);
+ }
+ #endif /* COMPAT_43 */
+@@ -900,6 +910,7 @@
+ 	SIG_CANTMASK(td->td_sigmask);
+ 	signotify(td);
+ 	PROC_UNLOCK(p);
++	td->td_pcb->pcb_flags |= PCB_FULLCTX;
+ 	return (EJUSTRETURN);
+ }
+ #endif	/* COMPAT_FREEBSD4 */
+@@ -1021,6 +1032,7 @@
+ 	SIG_CANTMASK(td->td_sigmask);
+ 	signotify(td);
+ 	PROC_UNLOCK(p);
++	td->td_pcb->pcb_flags |= PCB_FULLCTX;
+ 	return (EJUSTRETURN);
+ }
+ 
+@@ -1254,6 +1266,22 @@
+ 	cr0 |= CR0_MP | CR0_NE | CR0_TS | CR0_WP | CR0_AM;
+ 	load_cr0(cr0);
+ 	load_gs(_udatasel);
++
++	sysenter_setup();
++}
++
++void
++sysenter_setup(void)
++{
++	char *p;
++
++	if (cpu_feature & CPUID_SEP) {
++		p = sysenter_pcpus[PCPU_GET(cpuid)].stack +
++			 KSTACK_PAGES * PAGE_SIZE - sizeof(register_t);
++		wrmsr(MSR_SYSENTER_CS, GSEL(GCODE_SEL, SEL_KPL));
++		wrmsr(MSR_SYSENTER_EIP, (uint32_t)sysenter_syscall);
++		wrmsr(MSR_SYSENTER_ESP, (uint32_t)p);
++	}
+ }
+ 
+ static int
+@@ -2310,7 +2338,7 @@
+ 	_udatasel = GSEL(GUDATA_SEL, SEL_UPL);
+ 
+ 	/* setup proc 0's pcb */
+-	thread0.td_pcb->pcb_flags = 0; /* XXXKSE */
++	thread0.td_pcb->pcb_flags = 0;
+ #ifdef PAE
+ 	thread0.td_pcb->pcb_cr3 = (int)IdlePDPT;
+ #else
+@@ -2325,6 +2353,8 @@
+ {
+ 
+ 	pcpu->pc_acpi_id = 0xffffffff;
++	pcpu->pc_sysenter_stackptr = sysenter_pcpus[cpuid].stack +
++	 	KSTACK_PAGES * PAGE_SIZE - sizeof(register_t);
+ }
+ 
+ void
+@@ -2480,6 +2510,7 @@
+ 	tp->tf_esp = regs->r_esp;
+ 	tp->tf_ss = regs->r_ss;
+ 	pcb->pcb_gs = regs->r_gs;
++	pcb->pcb_flags |= PCB_FULLCTX;
+ 	return (0);
+ }
+ 
+@@ -2637,6 +2668,7 @@
+ 		tp->tf_esp = mcp->mc_esp;
+ 		tp->tf_ss = mcp->mc_ss;
+ 		td->td_pcb->pcb_gs = mcp->mc_gs;
++		td->td_pcb->pcb_flags |= PCB_FULLCTX;
+ 		ret = 0;
+ 	}
+ 	return (ret);
+Index: i386/swtch.s
+===================================================================
+RCS file: /home/ncvs/src/sys/i386/i386/swtch.s,v
+retrieving revision 1.152
+diff -u -r1.152 swtch.s
+--- i386/swtch.s	18 Jan 2006 06:42:42 -0000	1.152
++++ i386/swtch.s	18 May 2006 04:23:47 -0000
+@@ -192,6 +192,9 @@
+ 	je	1f				/* If not, use the default */
+ 	movl	$1, PCPU(PRIVATE_TSS) 		/* mark use of private tss */
+ 	movl	PCB_EXT(%edx), %edi		/* new tss descriptor */
++	movl    PCPU(SYSENTER_STACKPTR), %eax	/* sysenter stack ptr */
++	movl    PCB_EXT_TSS_ESP0(%edi), %ebx	/* ring 0 stack */
++	movl    %ebx, (%eax)
+ 	jmp	2f				/* Load it up */
+ 
+ 1:	/*
+@@ -201,6 +204,8 @@
+ 	 */
+ 	leal	-16(%edx), %ebx			/* leave space for vm86 */
+ 	movl	%ebx, PCPU(COMMON_TSS) + TSS_ESP0
++	movl    PCPU(SYSENTER_STACKPTR), %eax
++	movl    %ebx, (%eax)
+ 
+ 	/*
+ 	 * Test this CPU's  bit in the bitmap to see if this
+Index: i386/trap.c
+===================================================================
+RCS file: /home/ncvs/src/sys/i386/i386/trap.c,v
+retrieving revision 1.289
+diff -u -r1.289 trap.c
+--- i386/trap.c	8 Feb 2006 08:09:15 -0000	1.289
++++ i386/trap.c	18 May 2006 04:23:48 -0000
+@@ -536,15 +536,18 @@
+ 				frame.tf_eip = (int)doreti_iret_fault;
+ 				goto out;
+ 			}
+-			if (frame.tf_eip == (int)doreti_popl_ds) {
++			if (frame.tf_eip == (int)doreti_popl_ds ||
++			    frame.tf_eip == (int)sysenter_popl_ds) {
+ 				frame.tf_eip = (int)doreti_popl_ds_fault;
+ 				goto out;
+ 			}
+-			if (frame.tf_eip == (int)doreti_popl_es) {
++			if (frame.tf_eip == (int)doreti_popl_es ||
++			    frame.tf_eip == (int)sysenter_popl_es) {
+ 				frame.tf_eip = (int)doreti_popl_es_fault;
+ 				goto out;
+ 			}
+-			if (frame.tf_eip == (int)doreti_popl_fs) {
++			if (frame.tf_eip == (int)doreti_popl_fs ||
++			    frame.tf_eip == (int)sysenter_popl_fs) {
+ 				frame.tf_eip = (int)doreti_popl_fs_fault;
+ 				goto out;
+ 			}
+@@ -572,6 +575,35 @@
+ 			break;
+ 
+ 		case T_TRCTRAP:	 /* trace trap */
++			if (frame.tf_eip >= (int)sysenter_syscall &&
++			    frame.tf_eip < (int)sysenter_push_cs) {
++				/*
++				 * We've just entered system mode via the
++				 * syscall sysenter.  Continue single stepping
++				 * silently until the syscall handler has
++				 * saved the flags.
++				 */
++				goto out;
++			}
++
++			if (frame.tf_eip == (int)sysenter_push_cs) {
++				/*
++				 * The syscall handler has now saved the
++				 * flags.  Stop single stepping it.
++				 */
++				frame.tf_eflags &= ~PSL_T;
++				goto out;
++			}
++
++			if (frame.tf_eip == (int)sysenter_sysexit) {
++				/*
++				 * The syscall handler restored userland eflags.
++				 * Continue single stepping silently until the
++				 * syscall handler returns to userland.
++				 */
++				goto out;
++			}
++
+ 			if (frame.tf_eip == (int)IDTVEC(lcall_syscall)) {
+ 				/*
+ 				 * We've just entered system mode via the
+@@ -913,6 +945,7 @@
+ 	struct thread *td = curthread;
+ 	struct proc *p = td->td_proc;
+ 	register_t orig_tf_eflags;
++	register_t orig_edx;
+ 	int error;
+ 	int narg;
+ 	int args[8];
+@@ -941,8 +974,10 @@
+ 	if (p->p_flag & P_SA)
+ 		thread_user_enter(td);
+ 	params = (caddr_t)frame.tf_esp + sizeof(int);
++
+ 	code = frame.tf_eax;
+ 	orig_tf_eflags = frame.tf_eflags;
++	orig_edx = frame.tf_edx;
+ 
+ 	if (p->p_sysent->sv_prepsyscall) {
+ 		/*
+@@ -1054,6 +1089,13 @@
+ 		mtx_unlock(&Giant);
+ 
+ 	/*
++	 * If %edx was changed, we can not use sysexit, because it
++	 * needs %edx to restore userland %eip.
++	 */
++	if (orig_edx != frame.tf_edx)
++		td->td_pcb->pcb_flags |= PCB_FULLCTX;
++
++	/*
+ 	 * Traced syscall.
+ 	 */
+ 	if ((orig_tf_eflags & PSL_T) && !(orig_tf_eflags & PSL_VM)) {
+Index: include/md_var.h
+===================================================================
+RCS file: /home/ncvs/src/sys/i386/include/md_var.h,v
+retrieving revision 1.74
+diff -u -r1.74 md_var.h
+--- include/md_var.h	21 Apr 2006 04:28:43 -0000	1.74
++++ include/md_var.h	18 May 2006 04:23:48 -0000
+@@ -87,6 +87,12 @@
+ void	doreti_popl_es_fault(void) __asm(__STRING(doreti_popl_es_fault));
+ void	doreti_popl_fs(void) __asm(__STRING(doreti_popl_fs));
+ void	doreti_popl_fs_fault(void) __asm(__STRING(doreti_popl_fs_fault));
++void	sysenter_syscall(void) __asm(__STRING(sysenter_syscall));
++void	sysenter_push_cs(void) __asm(__STRING(sysenter_push_cs));
++void	sysenter_popl_ds(void) __asm(__STRING(sysenter_popl_ds));
++void	sysenter_popl_es(void) __asm(__STRING(sysenter_popl_es));
++void	sysenter_popl_fs(void) __asm(__STRING(sysenter_popl_fs));
++void	sysenter_sysexit(void) __asm(__STRING(sysenter_sysexit));
+ void	dump_add_page(vm_paddr_t);
+ void	dump_drop_page(vm_paddr_t);
+ void	enable_sse(void);
+Index: include/pcb.h
+===================================================================
+RCS file: /home/ncvs/src/sys/i386/include/pcb.h,v
+retrieving revision 1.56
+diff -u -r1.56 pcb.h
+--- include/pcb.h	29 Dec 2005 13:23:48 -0000	1.56
++++ include/pcb.h	18 May 2006 04:23:48 -0000
+@@ -67,6 +67,8 @@
+ #define	PCB_NPXTRAP	0x04	/* npx trap pending */
+ #define	PCB_NPXINITDONE	0x08	/* fpu state is initialized */
+ #define	PCB_VM86CALL	0x10	/* in vm86 call */
++#define	PCB_FULLCTX	0x40	/* sysenter syscall */
++#define	PCB_SYSENTER	0x80	/* sysenter syscall */
+ 
+ 	caddr_t	pcb_onfault;	/* copyin/out fault recovery */
+ 	int	pcb_gs;
+Index: include/pcpu.h
+===================================================================
+RCS file: /home/ncvs/src/sys/i386/include/pcpu.h,v
+retrieving revision 1.46
+diff -u -r1.46 pcpu.h
+--- include/pcpu.h	12 May 2006 22:41:58 -0000	1.46
++++ include/pcpu.h	18 May 2006 04:23:48 -0000
+@@ -55,7 +55,8 @@
+ 	int	pc_currentldt;						\
+ 	u_int	pc_acpi_id;						\
+ 	u_int	pc_apic_id;						\
+-	int	pc_private_tss	/* flag indicating private tss */
++	int	pc_private_tss;	/* flag indicating private tss */	\
++	void	*pc_sysenter_stackptr;
+ 
+ #if defined(lint)
+  
+Index: include/specialreg.h
+===================================================================
+RCS file: /home/ncvs/src/sys/i386/include/specialreg.h,v
+retrieving revision 1.29
+diff -u -r1.29 specialreg.h
+--- include/specialreg.h	1 May 2006 22:07:00 -0000	1.29
++++ include/specialreg.h	18 May 2006 04:23:48 -0000
+@@ -164,9 +164,9 @@
+ #define	MSR_BBL_CR_TRIG		0x11a
+ #define	MSR_BBL_CR_BUSY		0x11b
+ #define	MSR_BBL_CR_CTL3		0x11e
+-#define	MSR_SYSENTER_CS_MSR	0x174
+-#define	MSR_SYSENTER_ESP_MSR	0x175
+-#define	MSR_SYSENTER_EIP_MSR	0x176
++#define	MSR_SYSENTER_CS		0x174
++#define	MSR_SYSENTER_ESP	0x175
++#define	MSR_SYSENTER_EIP	0x176
+ #define MSR_MCG_CAP		0x179
+ #define MSR_MCG_STATUS		0x17a
+ #define MSR_MCG_CTL		0x17b
